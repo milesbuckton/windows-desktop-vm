@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+{#
+  windows-desktop-vm -- generated VM definition (QEMU argv).
+  aarch64 Windows 11 guest on the 'virt' machine under HVF (Apple Silicon).
+  Regenerated on every build; edit templates/launcher.j2, not the output.
+
+  Hardware mirrors the Linux fleet where Windows can support it:
+    * virtio-blk disk (viostor driver), virtio-net (NetKVM),
+      virtio-gpu (2D, viogpudo; default) or, with --gpu 3d,
+      virtio-gpu-gl (viogpu3d, experimental 3D via Venus/Vulkan),
+      virtio-balloon, virtio-rng, virtio-serial for qemu-ga.
+    * TPM 2.0 via a per-VM swtpm instance (Windows 11 requirement).
+    * Audio: Intel HDA (inbox Windows driver). virtio-snd has no Windows
+      driver. RDP audio is the reliable path anyway.
+    * RDP forwarded on loopback only (127.0.0.1:{{ rdp_port }} -> guest 3389),
+      the analog of the Linux fleet's loopback-only SSH forward.
+#}
+set -euo pipefail
+
+TARGET_DIR="{{ target_dir }}"
+{% if not no_tpm %}
+SWTPM_SOCK="$TARGET_DIR/swtpm.sock"
+TPM_STATE="$TARGET_DIR/swtpm-state"
+{% endif %}
+MON_SOCK="$TARGET_DIR/monitor.sock"
+QGA_SOCK="$TARGET_DIR/qga.sock"
+rm -f "$MON_SOCK" "$QGA_SOCK"
+
+# Install media (Windows ISO, virtio-win ISO, UNATTEND seed ISO) is only needed
+# until Windows is installed. The build writes .install-complete once the guest
+# verifies; after that the VM boots without the three CD drives. Delete the
+# file (or pass INSTALL_MEDIA=1) to attach them again.
+INSTALL_MEDIA_ARGS=()
+RAMFB_ARGS=()
+if [ "${INSTALL_MEDIA:-0}" = 1 ] || [ ! -e "$TARGET_DIR/.install-complete" ]; then
+  INSTALL_MEDIA_ARGS=(
+    -drive if=none,id=cd0,file="{{ windows_iso }}",media=cdrom,format=raw,readonly=on
+    -device usb-storage,drive=cd0,bus=xhci.0,bootindex=1
+    -drive if=none,id=cd1,file="{{ virtio_iso }}",media=cdrom,format=raw,readonly=on
+    -device usb-storage,drive=cd1,bus=xhci.0
+    -drive if=none,id=cd2,file="{{ seed_iso }}",media=cdrom,format=raw,readonly=on
+    -device usb-storage,drive=cd2,bus=xhci.0
+  )
+  RAMFB_ARGS=(-device ramfb)
+fi
+# ramfb is the boot display while Windows installs: the edk2 virtio-gpu GOP is
+# blit-only, so Windows' Basic Display Driver needs a linear framebuffer until
+# a virtio-gpu driver loads. Once installed it would only show up as a second
+# display, so it comes and goes with the install media (RAMFB_ARGS above).
+
+{% if gpu == "3d" %}
+# libepoxy resolves EGL at runtime via dlopen("libEGL.dylib"), which lives in
+# /opt/homebrew/lib and is NOT on QEMU's default dlopen search path. Export it
+# so cocoa,gl=es display init works.
+export DYLD_LIBRARY_PATH="/opt/homebrew/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+# Venus renderer (virgl_render_server) needs VK_ICD_FILENAMES to locate MoltenVK
+# on the host. Without it, venus init fails.
+export VK_ICD_FILENAMES="/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json"
+{% endif %}
+
+{% if not no_tpm %}
+# --- swtpm (TPM 2.0): spawned per VM, state kept inside the target dir.
+#     Not installed for you (detect, don't install) -- brew install swtpm.
+if [ ! -S "$SWTPM_SOCK" ]; then
+  mkdir -p "$TPM_STATE"
+  swtpm socket --tpm2 \
+    --tpmstate "dir=$TPM_STATE" \
+    --ctrl "type=unixio,path=$SWTPM_SOCK" \
+    --daemon
+  for _ in 1 2 3 4 5; do [ -S "$SWTPM_SOCK" ] && break; sleep 1; done
+fi
+cleanup() {
+  pkill -f "swtpm.*--tpmstate dir=$TPM_STATE" 2>/dev/null || true
+  rm -f "$SWTPM_SOCK"
+}
+trap cleanup EXIT
+{% endif %}
+
+qemu-system-aarch64 \
+  -name "{{ vm_name }}" \
+  -machine virt,accel=hvf,gic-version=3 \
+  -cpu host \
+  -smp {{ vcpus }} \
+  -m {{ memory_mb }} \
+  -rtc base=localtime,clock=host \
+  -drive if=pflash,format=raw,readonly=on,file="{{ ovmf_code }}" \
+  -drive if=pflash,format=raw,file="{{ ovmf_vars }}" \
+{% if not no_tpm %}
+  -chardev socket,id=chrtpm,path="$SWTPM_SOCK" \
+  -tpmdev emulator,id=tpm0,chardev=chrtpm \
+  -device tpm-tis-device,tpmdev=tpm0 \
+{% endif %}
+  -device qemu-xhci,id=xhci \
+  -device usb-kbd,bus=xhci.0 \
+  -device usb-tablet,bus=xhci.0 \
+  "${INSTALL_MEDIA_ARGS[@]+"${INSTALL_MEDIA_ARGS[@]}"}" \
+  -drive if=none,id=hd0,file="{{ disk_qcow2 }}",format=qcow2 \
+  -device virtio-blk-pci,drive=hd0,bootindex=0 \
+{% if gpu == "3d" %}
+  -device virtio-gpu-gl-pci,xres={{ xres }},yres={{ yres }},\
+blob=on,venus=on,hostmem={{ hostmem_mb }}M \
+{% else %}
+  -device virtio-gpu-pci,xres={{ xres }},yres={{ yres }} \
+{% endif %}
+  "${RAMFB_ARGS[@]+"${RAMFB_ARGS[@]}"}" \
+  -object rng-random,id=rng0,filename=/dev/urandom \
+  -device virtio-rng-pci,rng=rng0 \
+  -device virtio-balloon-pci \
+  -device virtio-serial-pci \
+  -chardev socket,id=qga0,path="$QGA_SOCK",server=on,wait=off \
+  -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0 \
+  -netdev user,id=net0,hostfwd=tcp:127.0.0.1:{{ rdp_port }}-:3389 \
+  -device virtio-net-pci,netdev=net0 \
+  -audiodev coreaudio,id=snd0 \
+  -device intel-hda \
+  -device hda-output,audiodev=snd0 \
+  -monitor unix:"$MON_SOCK",server=on,wait=off \
+{% if gpu == "3d" %}
+  -display cocoa,gl=es \
+{% else %}
+  -display cocoa \
+{% endif %}
+  "$@"

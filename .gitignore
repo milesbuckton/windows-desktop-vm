@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# VM / build artifacts (produced by setup_vm.py - never commit them)
+*.qcow2
+*.img
+*.iso
+*.log
+*.fd
+*.sock
+*.part
+/launch-vm.sh
+seed.iso
+install-info.json
+install-info.txt
+swtpm.pid
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Local target dirs
+VMs/
+out/
+build/
+dist/

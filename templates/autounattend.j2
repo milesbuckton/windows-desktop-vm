@@ -1,0 +1,235 @@
+<?xml version="1.0" encoding="utf-8"?>
+{#-
+  windows-desktop-vm -- autounattend.xml (Jinja2 template)
+  Target: Windows 11 ARM64 guest on the QEMU 'virt' machine, Apple Silicon (HVF).
+
+  Driver strategy (read before editing):
+    * PRIMARY: the orchestrator rebuilds the Windows ISO with the virtio ARM64
+      driver set placed at sources/$WinPEDriver$ (see scripts/inject-drivers.sh).
+      setup.exe loads them into WinPE before disk configuration (so the
+      virtio-blk disk is visible with no prompts) and injects them into the
+      offline image. No drive-letter guessing anywhere.
+    * FALLBACK: set driver_path_winpe (e.g. "E:\viostor\w11\ARM64") to emit a
+      Microsoft-Windows-PnpCustomizationsWinPE DriverPaths block. WinPE drive
+      letters depend on attach order -- fragile; that is why it is not the
+      default.
+    * The virtio-win ISO must remain attached at first logon: qemu-ga is
+      installed from it by FirstLogonCommands (volume label matched, so no
+      drive letter is needed there either).
+
+  Notes:
+    * bypass_requirements writes the LabConfig registry bypass keys. With a
+      swtpm-backed TPM 2.0 attached (the launcher's default) the hardware
+      check passes anyway and the keys are harmless. Set it false only if you
+      run a genuine Secure Boot firmware + TPM and want to prove it.
+    * wim_index is resolved at build time by the orchestrator with
+      `wimlib-imagex info` against sources/install.wim -- never hardcode it
+      here. (Install media shipping install.esd instead of install.wim is
+      rejected by Gate 1: convert it first.)
+-#}
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <SetupUILanguage>
+        <UILanguage>{{ ui_language }}</UILanguage>
+      </SetupUILanguage>
+      <InputLocale>{{ input_locale }}</InputLocale>
+      <SystemLocale>{{ system_locale }}</SystemLocale>
+      <UILanguage>{{ ui_language }}</UILanguage>
+      <UserLocale>{{ user_locale }}</UserLocale>
+    </component>
+
+    <component name="Microsoft-Windows-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+{%- if bypass_requirements %}
+      <RunSynchronous>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>LabConfig: bypass TPM 2.0 requirement</Description>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Description>LabConfig: bypass Secure Boot requirement</Description>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Description>LabConfig: bypass RAM requirement</Description>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Description>LabConfig: bypass CPU generation requirement</Description>
+          <Path>reg add HKLM\SYSTEM\Setup\LabConfig /v BypassCPUCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+{%- endif %}
+
+      <DiskConfiguration>
+        <WillShowUI>OnError</WillShowUI>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <CreatePartition wcm:action="add">
+              <Order>1</Order>
+              <Type>EFI</Type>
+              <Size>100</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>2</Order>
+              <Type>MSR</Type>
+              <Size>16</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>3</Order>
+              <Type>Primary</Type>
+              <Extend>true</Extend>
+            </CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order>
+              <PartitionID>1</PartitionID>
+              <Label>System</Label>
+              <Format>FAT32</Format>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>2</Order>
+              <PartitionID>2</PartitionID>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>3</Order>
+              <PartitionID>3</PartitionID>
+              <Label>Windows</Label>
+              <Letter>C</Letter>
+              <Format>NTFS</Format>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+
+      <ImageInstall>
+        <OSImage>
+          <InstallFrom>
+            <MetaData wcm:action="add">
+              <Key>/IMAGE/INDEX</Key>
+              <Value>{{ wim_index }}</Value>
+            </MetaData>
+          </InstallFrom>
+          <InstallTo>
+            <DiskID>0</DiskID>
+            <PartitionID>3</PartitionID>
+          </InstallTo>
+          <WillShowUI>OnError</WillShowUI>
+        </OSImage>
+      </ImageInstall>
+
+      <UserData>
+        <AcceptEula>true</AcceptEula>
+        {% if product_key %}
+        <ProductKey>
+          <Key>{{ product_key }}</Key>
+          <WillShowUI>Never</WillShowUI>
+        </ProductKey>
+        {% endif %}
+      </UserData>
+    </component>
+{%- if driver_path_winpe %}
+
+    <!-- FALLBACK ONLY: prefer rebuilding the ISO with sources/$WinPEDriver$. -->
+    <component name="Microsoft-Windows-PnpCustomizationsWinPE" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <DriverPaths>
+        <PathAndCredentials wcm:action="add" wcm:keyValue="1">
+          <Path>{{ driver_path_winpe }}</Path>
+        </PathAndCredentials>
+      </DriverPaths>
+    </component>
+{%- endif %}
+  </settings>
+
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <InputLocale>{{ input_locale }}</InputLocale>
+      <SystemLocale>{{ system_locale }}</SystemLocale>
+      <UILanguage>{{ ui_language }}</UILanguage>
+      <UserLocale>{{ user_locale }}</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <ComputerName>{{ hostname }}</ComputerName>
+      <TimeZone>{{ timezone }}</TimeZone>
+      <RegisteredOwner>{{ registered_owner }}</RegisteredOwner>
+      <RegisteredOrganization>{{ registered_org }}</RegisteredOrganization>
+    </component>
+  </settings>
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <InputLocale>{{ input_locale }}</InputLocale>
+      <SystemLocale>{{ system_locale }}</SystemLocale>
+      <UILanguage>{{ ui_language }}</UILanguage>
+      <UserLocale>{{ user_locale }}</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="arm64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>{{ username }}</Name>
+            <DisplayName>{{ display_name }}</DisplayName>
+            <Description>{{ user_description }}</Description>
+            <Group>Administrators</Group>
+            <Password>
+              <Value>{{ user_password | e }}</Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+      <AutoLogon>
+        <Enabled>true</Enabled>
+        <LogonCount>{{ autologon_count }}</LogonCount>
+        <Username>{{ username }}</Username>
+        <Password>
+          <Value>{{ user_password | e }}</Value>
+          <PlainText>true</PlainText>
+        </Password>
+      </AutoLogon>
+      <FirstLogonCommands>
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>Enable Remote Desktop (service + firewall) -- the management plane</Description>
+          <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private; Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0; Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'"</CommandLine>
+        </SynchronousCommand>
+{%- if install_qemu_ga %}
+        <SynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Description>Install QEMU guest agent from the virtio-win ISO (matched by volume label, so no drive letter needed)</Description>
+          <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='SilentlyContinue'; $d=(Get-Volume -FileSystemLabel '{{ virtio_volume_label }}' | Select-Object -First 1).DriveLetter; if ($d) { Start-Process msiexec.exe -ArgumentList '/i', ('{0}:\{{ qemu_ga_msi }}' -f $d), '/qn', '/norestart' -Wait }"</CommandLine>
+        </SynchronousCommand>
+{%- endif %}
+        <SynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Description>Ground-truth marker -- mirrors /var/log/*-vm-setup.log on the Linux fleet</Description>
+          <CommandLine>cmd /c echo windows-vm-setup: first-logon finished at %DATE% %TIME% > C:\Windows\Setup\windows-vm-setup.log</CommandLine>
+        </SynchronousCommand>
+        <SynchronousCommand wcm:action="add">
+          <Order>4</Order>
+{%- if gpu == "3d" %}
+          <Description>Test-signing, cert, hibernation; viogpu3d installs on the next boot (test-signed kernel drivers only install once test signing is active)</Description>
+          <CommandLine>powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Transcript C:\Windows\Setup\viogpu3d-firstlogon.log; bcdedit /set testsigning on; powercfg /hibernate off; $u=(Get-Volume -FileSystemLabel 'UNATTEND' | Select-Object -First 1).DriveLetter; if ($u -and (Test-Path ('{0}:\viogpu3d' -f $u))) { Copy-Item ('{0}:\viogpu3d' -f $u) C:\viogpu3d -Recurse -Force; schtasks /create /tn viogpu3d-install /sc onstart /ru SYSTEM /rl highest /f /tr C:\viogpu3d\install.cmd } else { Write-Output 'UNATTEND\viogpu3d not found' }; Stop-Transcript; Restart-Computer -Force"</CommandLine>
+{%- else %}
+          <Description>Disable hibernation</Description>
+          <CommandLine>powercfg /hibernate off</CommandLine>
+{%- endif %}
+        </SynchronousCommand>
+      </FirstLogonCommands>
+    </component>
+  </settings>
+</unattend>
