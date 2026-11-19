@@ -1,0 +1,5 @@
+{
+  "url": "https://example.invalid/Win11_25H2_English_Arm64.iso",
+  "sha256": "<self-recorded: shasum -a 256 of your downloaded ISO>",
+  "note": "Download from https://www.microsoft.com/software-download/windows11arm64, then record the real URL + sha256 here. The placeholder URL above is invalid on purpose until you do."
+}

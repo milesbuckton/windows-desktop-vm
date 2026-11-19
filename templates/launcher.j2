@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+{#
+  windows-desktop-vm -- generated VM definition (QEMU argv).
+  aarch64 Windows 11 guest on the 'virt' machine under HVF (Apple Silicon).
+  Regenerated on every build; edit templates/launcher.j2, not the output.
+
+  Hardware mirrors the Linux fleet where Windows can support it:
+    * virtio-blk disk (viostor driver), virtio-net (NetKVM),
+      virtio-gpu (2D, viogpudo; default) or, with --gpu 3d,
+      virtio-gpu-gl (viogpu3d, experimental 3D via Venus/Vulkan),
+      virtio-balloon, virtio-rng, virtio-serial for qemu-ga.
+    * TPM 2.0 via a per-VM swtpm instance (Windows 11 requirement).
+    * Audio: Intel HDA (inbox Windows driver) with hda-micro: speaker out
+      plus a microphone in (hda-duplex would show up as "Line In").
+      virtio-snd has no Windows driver. RDP audio is the reliable path anyway.
+    * RDP forwarded on loopback only (127.0.0.1:{{ rdp_port }} -> guest 3389),
+      the analog of the Linux fleet's loopback-only SSH forward.
+#}
+set -euo pipefail
+
+TARGET_DIR={{ target_dir | sh }}
+# The same directory with ',' doubled, for paths inside QEMU option lists.
+QDIR={{ target_dir | qopt | sh }}
+{% if not no_tpm %}
+SWTPM_SOCK="$TARGET_DIR/swtpm.sock"
+SWTPM_PID="$TARGET_DIR/swtpm.pid"
+TPM_STATE="$TARGET_DIR/swtpm-state"
+{% endif %}
+MON_SOCK="$TARGET_DIR/monitor.sock"
+QGA_SOCK="$TARGET_DIR/qga.sock"
+rm -f "$MON_SOCK" "$QGA_SOCK"
+
+# Install media (Windows ISO, virtio-win ISO, UNATTEND seed ISO) is only needed
+# until Windows is installed. The build writes .install-complete once the guest
+# verifies; after that the VM boots without the three CD drives. Delete the
+# file (or pass INSTALL_MEDIA=1) to attach them again.
+INSTALL_MEDIA_ARGS=()
+RAMFB_ARGS=(-device ramfb)
+if [ "${INSTALL_MEDIA:-0}" = 1 ] || [ ! -e "$TARGET_DIR/.install-complete" ]; then
+  INSTALL_MEDIA_ARGS=(
+    -drive {{ ("if=none,id=cd0,media=cdrom,format=raw,readonly=on,file=" ~ (windows_iso | qopt)) | sh }}
+    -device usb-storage,drive=cd0,bus=xhci.0,bootindex=1
+    -drive {{ ("if=none,id=cd1,media=cdrom,format=raw,readonly=on,file=" ~ (virtio_iso | qopt)) | sh }}
+    -device usb-storage,drive=cd1,bus=xhci.0
+    -drive {{ ("if=none,id=cd2,media=cdrom,format=raw,readonly=on,file=" ~ (seed_iso | qopt)) | sh }}
+    -device usb-storage,drive=cd2,bus=xhci.0
+  )
+fi
+# ramfb is always attached: it is the boot display during Windows Setup (the
+# edk2 virtio-gpu GOP is blit-only, so Windows' Basic Display Driver needs a
+# linear framebuffer until a virtio-gpu driver loads) and remains attached
+# afterwards: without it the virtio-gpu display's resolution is greyed out in
+# Windows. It shows up as a second display; "Show only on" the virtio-gpu one
+# in Windows' Display settings hides it.
+
+{% if gpu == "3d" %}
+# libepoxy resolves EGL at runtime via dlopen("libEGL.dylib"), which lives in
+# /opt/homebrew/lib and is NOT on QEMU's default dlopen search path. Export it
+# so cocoa,gl=es display init works.
+export DYLD_LIBRARY_PATH="/opt/homebrew/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+# Venus renderer (virgl_render_server) loads the host Vulkan driver chosen by
+# --host-vulkan-driver. VK_DRIVER_FILES is the current loader variable;
+# VK_ICD_FILENAMES is its older name, kept for older loaders.
+export VK_DRIVER_FILES={{ host_vulkan_icd | sh }}
+export VK_ICD_FILENAMES={{ host_vulkan_icd | sh }}
+{% endif %}
+
+{% if not no_tpm %}
+# --- swtpm (TPM 2.0): spawned per VM, state kept inside the target dir.
+#     Not installed for you (detect, don't install) -- brew install swtpm.
+#     A socket left behind by a killed swtpm is not trusted: only a live
+#     process from the pid file is reused.
+if ! { [ -S "$SWTPM_SOCK" ] && [ -f "$SWTPM_PID" ] && kill -0 "$(cat "$SWTPM_PID")" 2>/dev/null; }; then
+  rm -f "$SWTPM_SOCK" "$SWTPM_PID"
+  mkdir -p "$TPM_STATE"
+  swtpm socket --tpm2 \
+    --tpmstate "dir=$TPM_STATE" \
+    --ctrl "type=unixio,path=$SWTPM_SOCK" \
+    --pid "file=$SWTPM_PID" \
+    --daemon
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -S "$SWTPM_SOCK" ] && break; sleep 0.5; done
+  [ -S "$SWTPM_SOCK" ] || { echo "ERROR: swtpm did not create $SWTPM_SOCK" >&2; exit 1; }
+fi
+cleanup() {
+  if [ -f "$SWTPM_PID" ]; then
+    kill "$(cat "$SWTPM_PID")" 2>/dev/null || true
+  fi
+  rm -f "$SWTPM_SOCK" "$SWTPM_PID"
+}
+trap cleanup EXIT
+{% endif %}
+
+{{ qemu_system | sh }} \
+  -name {{ vm_name | qopt | sh }} \
+  -machine virt,accel=hvf,gic-version=3 \
+  -cpu host \
+  -smp {{ vcpus | int }} \
+  -m {{ memory_mb | int }} \
+  -rtc base=localtime,clock=host \
+  -drive {{ ("if=pflash,format=raw,readonly=on,file=" ~ (ovmf_code | qopt)) | sh }} \
+  -drive {{ ("if=pflash,format=raw,file=" ~ (ovmf_vars | qopt)) | sh }} \
+{% if not no_tpm %}
+  -chardev socket,id=chrtpm,path="$QDIR/swtpm.sock" \
+  -tpmdev emulator,id=tpm0,chardev=chrtpm \
+  -device tpm-tis-device,tpmdev=tpm0 \
+{% endif %}
+  -device qemu-xhci,id=xhci \
+  -device usb-kbd,bus=xhci.0 \
+  -device usb-tablet,bus=xhci.0 \
+  "${INSTALL_MEDIA_ARGS[@]+"${INSTALL_MEDIA_ARGS[@]}"}" \
+  -drive {{ ("if=none,id=hd0,format=qcow2,file=" ~ (disk_qcow2 | qopt)) | sh }} \
+  -device virtio-blk-pci,drive=hd0,bootindex=0 \
+{% if gpu == "3d" %}
+  -device virtio-gpu-gl-pci,blob=on,venus=on,hostmem={{ hostmem_mb | int }}M \
+{% else %}
+  -device virtio-gpu-pci \
+{% endif %}
+  "${RAMFB_ARGS[@]+"${RAMFB_ARGS[@]}"}" \
+  -object rng-random,id=rng0,filename=/dev/urandom \
+  -device virtio-rng-pci,rng=rng0 \
+  -device virtio-balloon-pci \
+  -device virtio-serial-pci \
+  -chardev socket,id=qga0,path="$QDIR/qga.sock",server=on,wait=off \
+  -device virtserialport,chardev=qga0,name=org.qemu.guest_agent.0 \
+  -netdev user,id=net0,hostfwd=tcp:127.0.0.1:{{ rdp_port | int }}-:3389 \
+  -device virtio-net-pci,netdev=net0 \
+  -audiodev coreaudio,id=snd0,timer-period=20000,out.buffer-length=23220,out.buffer-count=24,in.buffer-length=23220,in.buffer-count=24 \
+  -device intel-hda \
+  -device hda-micro,audiodev=snd0 \
+  -monitor unix:"$QDIR/monitor.sock",server=on,wait=off \
+{% if gpu == "3d" %}
+  -display cocoa,gl=es \
+{% else %}
+  -display cocoa \
+{% endif %}
+  "$@"
